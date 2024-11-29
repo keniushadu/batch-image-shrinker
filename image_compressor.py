@@ -24,13 +24,16 @@ class CompressionStats:
         self.skipped_count = 0
         self.total_original_size = 0
         self.total_compressed_size = 0
+        self.resolution_stats = {}  # 添加分辨率统计
 
-    def update(self, original_size, compressed_size):
+    def update(self, original_size, compressed_size, resolution=None):
         with self.lock:
             if original_size and compressed_size:
                 self.processed_count += 1
                 self.total_original_size += original_size
                 self.total_compressed_size += compressed_size
+                if resolution:
+                    self.resolution_stats[resolution] = self.resolution_stats.get(resolution, 0) + 1
             else:
                 self.skipped_count += 1
 
@@ -49,13 +52,124 @@ def get_compressed_filename(filepath: str) -> str:
     name, ext = os.path.splitext(filename)
     return os.path.join(directory, f"{name}_min{ext}")
 
-def compress_image(input_path: str, quality: int = 50) -> tuple:
+def analyze_image_resolutions(directory_path: str) -> dict:
+    """
+    分析目录中所有图片的分辨率分布
+    
+    Args:
+        directory_path: 目录路径
+        
+    Returns:
+        dict: 分辨率统计信息
+    """
+    stats = CompressionStats()
+    
+    def process_image(filepath):
+        try:
+            with Image.open(filepath) as img:
+                resolution = f"{img.width}x{img.height}"
+                stats.update(1, 1, resolution)  # 使用虚拟大小，主要关注分辨率统计
+        except Exception as e:
+            with log_lock:
+                logger.error(f"处理文件 {filepath} 时出错: {str(e)}")
+    
+    with ThreadPoolExecutor(max_workers=multiprocessing.cpu_count()) as executor:
+        futures = []
+        for root, _, files in os.walk(directory_path):
+            for filename in files:
+                if filename.lower().endswith(('.png', '.jpg', '.jpeg', '.webp')):
+                    filepath = os.path.join(root, filename)
+                    futures.append(executor.submit(process_image, filepath))
+        
+        for future in as_completed(futures):
+            future.result()
+    
+    # 按照图片数量排序并打印统计信息
+    sorted_stats = sorted(stats.resolution_stats.items(), key=lambda x: x[1], reverse=True)
+    total_images = sum(count for _, count in sorted_stats)
+    
+    logger.info("\n分辨率分布统计:")
+    for resolution, count in sorted_stats:
+        percentage = (count / total_images) * 100
+        logger.info(f"{resolution}: {count} 张图片 ({percentage:.1f}%)")
+    
+    return stats.resolution_stats
+
+def resize_image(image: Image.Image, target_width: int = None, target_height: int = None, scale_ratio: float = 0.5) -> Image.Image:
+    """
+    调整图片分辨率，当图片分辨率超过目标分辨率时，按照给定比例压缩
+    
+    Args:
+        image: PIL Image对象
+        target_width: 目标宽度
+        target_height: 目标高度
+        scale_ratio: 压缩比例（0-1之间），默认0.5表示压缩到超出部分的一半
+        
+    Returns:
+        Image.Image: 调整后的图片
+    """
+    if not target_width and not target_height:
+        return image
+    
+    original_width, original_height = image.size
+    
+    # 如果指定了宽度和高度
+    if target_width and target_height:
+        # 只有当原始尺寸超过目标尺寸时才调整
+        if original_width <= target_width and original_height <= target_height:
+            return image
+            
+        # 计算宽度和高度的压缩比例
+        width_ratio = (original_width - target_width) * scale_ratio + target_width
+        height_ratio = (original_height - target_height) * scale_ratio + target_height
+        
+        # 保持宽高比，选择较小的缩放比例
+        scale = min(width_ratio / original_width, height_ratio / original_height)
+        new_size = (int(original_width * scale), int(original_height * scale))
+        
+    # 如果只指定了宽度
+    elif target_width:
+        # 只有当原始宽度超过目标宽度时才调整
+        if original_width <= target_width:
+            return image
+            
+        # 计算新的宽度
+        new_width = (original_width - target_width) * scale_ratio + target_width
+        # 保持宽高比
+        scale = new_width / original_width
+        new_size = (int(new_width), int(original_height * scale))
+        
+    # 如果只指定了高度
+    else:  # target_height
+        # 只有当原始高度超过目标高度时才调整
+        if original_height <= target_height:
+            return image
+            
+        # 计算新的高度
+        new_height = (original_height - target_height) * scale_ratio + target_height
+        # 保持宽高比
+        scale = new_height / original_height
+        new_size = (int(original_width * scale), int(new_height))
+    
+    # 使用LANCZOS算法进行高质量的图片缩放
+    resized_image = image.resize(new_size, Image.Resampling.LANCZOS)
+    
+    with log_lock:
+        logger.info(f"调整分辨率: {original_width}x{original_height} -> {new_size[0]}x{new_size[1]}")
+        logger.info(f"压缩比例: {scale:.2f}")
+    
+    return resized_image
+
+def compress_image(input_path: str, quality: int = 50, target_width: int = None, target_height: int = None, scale_ratio: float = 0.5) -> tuple:
     """
     压缩单个图片，保存为新文件
     
     Args:
         input_path: 输入图片路径
         quality: 压缩质量（1-100）
+        target_width: 目标宽度
+        target_height: 目标高度
+        scale_ratio: 压缩比例（0-1之间）
         
     Returns:
         tuple: (原始大小, 压缩后大小) 如果压缩后文件更大则返回 None
@@ -63,73 +177,88 @@ def compress_image(input_path: str, quality: int = 50) -> tuple:
     try:
         # 获取原始文件大小
         original_size = os.path.getsize(input_path)
-        
-        # 生成压缩后的文件路径
         output_path = get_compressed_filename(input_path)
         
-        # 打开并压缩图片
         with Image.open(input_path) as img:
-            # 保持原始格式
-            img_format = img.format
+            # 保存原始格式和模式
+            original_format = img.format
+            original_mode = img.mode
             
-            # 根据不同格式采用不同的压缩策略
-            if img_format == 'PNG':
-                # 对于PNG，尝试保持原始模式
-                if 'A' in img.mode:  # 如果有透明通道
-                    # 使用RGBA模式
-                    img_to_save = img
+            # 如果需要调整分辨率
+            if target_width or target_height:
+                img = resize_image(img, target_width, target_height, scale_ratio)
+            
+            # 根据图片模式选择保存参数
+            save_args = {'quality': quality, 'optimize': True}
+            
+            # 处理不同格式的特殊情况
+            if original_format == 'PNG':
+                if original_mode == 'RGBA':
+                    # PNG with alpha channel
+                    save_args = {
+                        'optimize': True,
+                        'quality': quality,
+                        'format': 'PNG'
+                    }
                 else:
-                    # 如果没有透明通道，转换为RGB
-                    img_to_save = img.convert('RGB')
-                # PNG特定的优化参数
-                img_to_save.save(output_path, format=img_format, optimize=True,
-                               quality=quality)
-            else:
-                # JPG/JPEG的处理
-                if img.mode in ('RGBA', 'P'):
-                    img_to_save = img.convert('RGB')
-                else:
-                    img_to_save = img
-                # JPEG特定的优化参数
-                img_to_save.save(output_path, format=img_format, quality=quality,
-                               optimize=True, progressive=True)
-        
-        # 获取压缩后文件大小
-        compressed_size = os.path.getsize(output_path)
-        
-        # 如果压缩后的文件更大，删除压缩文件并返回None
-        if compressed_size >= original_size:
-            os.remove(output_path)
+                    # PNG without alpha channel
+                    save_args = {
+                        'optimize': True,
+                        'quality': quality,
+                        'format': 'PNG'
+                    }
+            elif original_format == 'JPEG':
+                save_args = {
+                    'quality': quality,
+                    'optimize': True,
+                    'format': 'JPEG'
+                }
+            elif original_format == 'WEBP':
+                save_args = {
+                    'quality': quality,
+                    'format': 'WEBP',
+                    'lossless': original_mode == 'RGBA'  # 如果有Alpha通道，使用无损压缩
+                }
+            
+            # 保存压缩后的图片
+            img.save(output_path, **save_args)
+            
+            # 检查压缩后的大小
+            compressed_size = os.path.getsize(output_path)
+            
+            # 如果压缩后的文件更大，删除压缩后的文件并返回None
+            if compressed_size >= original_size:
+                os.remove(output_path)
+                with log_lock:
+                    logger.info(f"跳过 {input_path}: 压缩后文件更大")
+                return None, None
+            
             with log_lock:
-                logger.info(f"跳过 {os.path.basename(input_path)} - 压缩后文件更大")
-            return None, None
-        
-        with log_lock:
-            compression_ratio = (1 - compressed_size / original_size) * 100
-            logger.info(f"压缩完成: {os.path.basename(input_path)}")
-            logger.info(f"压缩后文件: {os.path.basename(output_path)}")
-            logger.info(f"原始大小: {original_size/1024:.2f}KB")
-            logger.info(f"压缩后大小: {compressed_size/1024:.2f}KB")
-            logger.info(f"压缩率: {compression_ratio:.2f}%")
-            logger.info("-" * 50)
-        
-        return original_size, compressed_size
-        
+                logger.info(f"处理: {input_path}")
+                logger.info(f"格式: {original_format}, 模式: {original_mode}")
+                logger.info(f"原始大小: {original_size/1024:.1f}KB")
+                logger.info(f"压缩后大小: {compressed_size/1024:.1f}KB")
+                logger.info(f"压缩率: {(1 - compressed_size/original_size)*100:.1f}%")
+            
+            return original_size, compressed_size
+            
     except Exception as e:
         with log_lock:
-            logger.error(f"处理图片 {input_path} 时发生错误: {str(e)}")
-        # 如果发生错误，确保删除可能存在的输出文件
-        if 'output_path' in locals() and os.path.exists(output_path):
+            logger.error(f"处理文件 {input_path} 时出错: {str(e)}")
+        if os.path.exists(output_path):
             os.remove(output_path)
         return None, None
 
-def process_directory(directory_path: str, quality: int = 50) -> None:
+def process_directory(directory_path: str, quality: int = 50, target_width: int = None, target_height: int = None, scale_ratio: float = 0.5) -> None:
     """
     处理目录中的所有图片
     
     Args:
         directory_path: 目录路径
         quality: 压缩质量（1-100）
+        target_width: 目标宽度
+        target_height: 目标高度
+        scale_ratio: 压缩比例（0-1之间）
     """
     supported_formats = {'.jpg', '.jpeg', '.png'}
     stats = CompressionStats()
@@ -161,7 +290,7 @@ def process_directory(directory_path: str, quality: int = 50) -> None:
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             # 提交所有任务
             future_to_file = {
-                executor.submit(compress_image, f, quality): f 
+                executor.submit(compress_image, f, quality, target_width, target_height, scale_ratio): f 
                 for f in files_to_process
             }
             
@@ -240,30 +369,32 @@ def replace_with_compressed(directory_path: str) -> None:
 def main():
     if len(sys.argv) < 2:
         print("使用方法:")
-        print("压缩图片: python image_compressor.py compress <目录路径> [压缩质量(1-100)]")
+        print("分析分辨率: python image_compressor.py analyze <目录路径>")
+        print("压缩图片: python image_compressor.py compress <目录路径> [质量(1-100)] [目标宽度] [目标高度] [压缩比例(0-1)]")
         print("替换原文件: python image_compressor.py replace <目录路径>")
-        return
+        sys.exit(1)
 
     command = sys.argv[1]
-    if command not in ['compress', 'replace']:
-        print("无效的命令。请使用 'compress' 或 'replace'")
-        return
+    directory_path = sys.argv[2] if len(sys.argv) > 2 else "."
 
-    directory_path = sys.argv[2] if len(sys.argv) > 2 else '.'
-    
-    if not os.path.isdir(directory_path):
-        print(f"错误：'{directory_path}' 不是有效的目录")
-        return
-
-    if command == 'compress':
-        # 获取压缩质量，默认为50
+    if command == "analyze":
+        analyze_image_resolutions(directory_path)
+    elif command == "compress":
         quality = int(sys.argv[3]) if len(sys.argv) > 3 else 50
-        if quality < 1 or quality > 100:
-            print("压缩质量必须在1-100之间")
-            return
-        process_directory(directory_path, quality)
-    else:  # replace
+        target_width = int(sys.argv[4]) if len(sys.argv) > 4 else None
+        target_height = int(sys.argv[5]) if len(sys.argv) > 5 else None
+        scale_ratio = float(sys.argv[6]) if len(sys.argv) > 6 else 0.5
+        
+        if scale_ratio < 0 or scale_ratio > 1:
+            print("压缩比例必须在0-1之间")
+            sys.exit(1)
+            
+        process_directory(directory_path, quality, target_width, target_height, scale_ratio)
+    elif command == "replace":
         replace_with_compressed(directory_path)
+    else:
+        print("未知命令。请使用 analyze, compress 或 replace")
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
